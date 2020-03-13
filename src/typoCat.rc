@@ -1,0 +1,5 @@
+FB_PROGRAM_ICON ICON res\typocat.ico
+
+BM_CAT1  BITMAP res\catU.bmp
+BM_CAT2  BITMAP res\catD.bmp
+
