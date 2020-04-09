@@ -1,34 +1,54 @@
 ''''''''''''''''''''''''''''''''''''
 '           Typo The Cat           '
 '                                  '
-' (C) Copyright Graham Downey 2020 '
+'           Version 1.2            '
+'                                  '
+'       (C) Copyright 2020         '
+'     Written by Graham Downey     '
+'                                  '
 ''''''''''''''''''''''''''''''''''''
 #define fbc -s gui typocat.rc
+
 #include "windows.bi"
 #include "win\winuser.bi"
 #include "win\shellapi.bi"
 #include "dir.bi"
 #include "crt.bi"
 
+#undef ExtCreateRegion
+'#define DebugObjects
+
+'#define DbgPrint(_S) OutputDebugString(_S & !"\r\n"):puts(_S)
+#define DbgPrint(_S) scope:end scope
+
 #include "DoubleBuffer.bas"
 
-#define ShowDebug 0
-Declare Function createWindowRegion(hdcSource as HDC, bmSource as BITMAP, clrTrans as COLORREF = BGR(255, 0, 255)) as HRGN
+Declare Function LoadImageAndMask(hInst as HINSTANCE, pzName as zstring ptr, byref hImage as HBITMAP, byref hMask as HBITMAP, uTransparency as COLORREF = &hFF00FF) as integer
 Declare Sub WinMain(hInstance as HINSTANCE, hPrevInstance as HINSTANCE, szCmdLine as PSTR, iCmdShow as Integer)
-Declare Sub loadSkin(hDC as HDC, sSkinPath as string)
 Declare Sub loadSettings()
+Declare Sub loadSkin(hDC as HDC, sSkinPath as string)
+Declare Sub ReleaseResources()  
+Declare Sub ReShowWindow(hwnd as HWND, iNoTrans as long = 1)
+Declare Sub SetWndRegion(hWnd as HWND, hRgn as HRGN, iRedraw as integer)
+Declare Function CheckKeyStates() as integer
+
+' Function pointer to AnnoyProc
+Dim Shared AnnoyProc as Sub()
 
 Const WINDOW_WIDTH = 320, WINDOW_HEIGHT = 240
 Dim shared as HWND hwndMain, hWndSkinSelect
-static shared as HRGN hRgnMain, hRgnLeft, hRgnRight, hRgnBoth
+static shared as HRGN hRgnMain, hRgnLeft, hRgnRight, hRgnBoth, hRgnCur
 Dim Shared as HINSTANCE hInstance
 Dim Shared as String szAppName
 Dim Shared as String szCaption
+Dim shared tOsVer as OSVERSIONINFO
+Dim shared as long IsWin32s, IsWin2K
 
-' Context menu items
 enum ContextMenuCommands
     CMC_SKINS
+    CMC_ANNOYING
     CMC_CUSTOMLR
+    CMC_ABOUT
     CMC_QUIT
 end enum
 
@@ -40,33 +60,97 @@ enum CatBitmaps
     CBM_BOTH
     CBM_LAST  
 end enum
-Const as integer TOTAL_CATS = CBM_LAST-1        ' Number of frames of cat animation
-Dim shared as integer iCatPic = CBM_WAITING     ' Current cat pic being displayed
-Dim shared as integer iSelectedSkin = -1        ' index of currently selected skin
-Dim shared as string sCurSkin                   ' Directory of current skin
-Dim shared as BITMAP bmCatBitmap                ' Bitmap info struct
-Dim shared as HBITMAP hbmCatBitmaps(TOTAL_CATS) ' Bitmap handle for each frame
+
+Const as integer TOTAL_CATS = CBM_LAST-1
+const KD_LEFT  = 1, _
+      KD_RIGHT = 2, _
+      KD_BOTH  = 3, _
+      KD_NONE  = 0
+
+Dim shared as integer iCatPic = CBM_WAITING
+Dim shared as integer iSelectedSkin = -1
+Dim shared as string sCurSkin
+dim shared as HPALETTE hPalDither
+Dim shared as BITMAP bmCatBitmap                   ' Bitmap info struct
+Static shared as HBITMAP hbmCatBmps(TOTAL_CATS)    ' Bitmap handle for each frame
+Static shared as HBITMAP hbmCatMasks(TOTAL_CATS)   ' Masks for each frame
 
 Dim shared as integer iCustomLeftRight = TRUE ' Distinguish left/right shift/ctrl
+Dim shared as integer iAnnoyingMode = FALSE   ' Enable annoyingness
+Dim shared as integer iAnnoyWait = 600000     ' How many ms to wait before annoying
+Dim shared as integer iWaitKeyPress = FALSE   ' Do keypresses reset the timer?
 
+' Check if we're running on Win32s
+tOsVer.dwOSVersionInfoSize = sizeof(tOsVer)
+GetVersionEx(@tOsVer)
+IsWin32s = (tOsVer.dwPlatformId = VER_PLATFORM_WIN32s)
+IsWin2K = (tOsVer.dwMajorVersion >= 5)
+
+DbgPrint("Load Settings...")
 hInstance = GetModuleHandle(NULL)
 szAppName = "Typo Cat"
 szCaption = "Typo Cat"
 
 'Launch into WinMain()
-dim as string sCommand = ""'Command ' Command doesn't work on win32s rtlib
-WinMain(hInstance, NULL, sCommand, SW_NORMAL)
+WinMain(hInstance, NULL, GetCommandLine, SW_NORMAL)
 
+' Mini message loop to simulate Yield() while loading bitmaps
+Sub ProcessMessages() 
+    static as MSG msg = any
+    while (PeekMessage(@msg, NULL, 0, 0, PM_REMOVE))
+        TranslateMessage(@msg)
+        DispatchMessage(@msg)
+    wend
+End Sub
+
+#include "BitmapsAndRegions.bas"
 #include "SkinPicker.bas"
 
 Function WndProc (hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as LPARAM) as LRESULT
-    Static as HMENU hContextMenu
+    Static as HMENU hContextMenu ' Right click context menu
+    Static as DWORD dwAnnoyTicks ' Ticks since last AnnoyProc()
+    
+    ' Manage pseudo transparency on Win32s
+    if IsWin32s then
+        static as integer iIgnore
+        select case iMsg
+        case WM_ERASEBKGND
+            return 1
+            
+        case WM_RBUTTONDOWN ' Open popup menu if right mouse clicked
+            dim as point MyPT = type(cshort(LOWORD(lParam)), cshort(HIWORD(lParam)))
+            ClientToScreen(hWnd, @MyPT)
+            SendMessage(hwnd, WM_CONTEXTMENU, wParam, MAKELPARAM(MyPT.x, MyPT.y))
+            
+        case WM_NCHITTEST ' Enable dragging when client clicked
+            var iResu = DefWindowProc(hWnd, iMsg, wParam, lParam)
+            if iResu = HTCLIENT	then               
+                if (GetAsyncKeyState(VK_LBUTTON) AND &H8000) then
+                    return HTCAPTION
+                end if
+            end if
+            return iResu
+            
+        case WM_SIZE, WM_MOVE ' Redraw window on move/resize
+            if (GetAsyncKeyState(VK_LBUTTON) AND &H8000)=0 then        
+                ReShowWindow(hwnd, 0)
+            end if
+            
+        case WM_TIMER ' Redraw the window every timer tick
+            static dwTicks as DWORD
+            var dwNewTicks = GetTickCount()
+            if abs(dwNewTicks-dwTicks) > 500 then
+                dwTicks = dwNewTicks   
+                InvalidateRect(hwnd, null, true)    
+            end if      
+        end select
+    end if
     
     Select Case iMsg
     Case WM_CREATE
-        hwndMain = hWnd
-        setDoubleBuffer(hWnd) ' Prevents flickering
-        
+        hwndMain = hWnd        
+        DbgPrint("WM_CREATE")
+      
         '**** Center window on desktop ****'
         Scope   'Calculate Client Area Size
             Dim as rect RcWnd = any, RcCli = Any, RcDesk = any
@@ -84,43 +168,140 @@ Function WndProc (hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as LPARA
             end with
         end Scope        
 
-        ' Create right click context menu
+        DbgPrint("Creating popup menu")
         hContextMenu = CreatePopupMenu()
+        if hContextMenu = 0 then 
+            DbgPrint("Failed to create popup menu")
+        end if
+
         AppendMenu(hContextMenu, MF_STRING, CMC_SKINS, @"Skin...")
-        dim as integer iChecked = 0' Set checked state to that of iCustomLeftRight
-        if iCustomLeftRight then iChecked = MF_CHECKED
+        AppendMenu(hContextMenu, MF_SEPARATOR, NULL, NULL)
+        
+        var iChecked = iif(iAnnoyingMode, MF_CHECKED, MF_UNCHECKED)
+        if IsWin2K AndAlso AnnoyProc <> 0 then
+            AppendMenu(hContextMenu, MF_STRING OR iChecked, CMC_ANNOYING, @"Annoying Mode")
+        end if
+
+        iChecked = iif(iCustomLeftRight, MF_CHECKED, MF_UNCHECKED)
         AppendMenu(hContextMenu, MF_STRING OR iChecked, CMC_CUSTOMLR, @"Distinguish left/right")
+                
+        AppendMenu(hContextMenu, MF_SEPARATOR, NULL, NULL)
+        AppendMenu(hContextMenu, MF_STRING, CMC_ABOUT, @"About") 
         AppendMenu(hContextMenu, MF_SEPARATOR, NULL, NULL)
         AppendMenu(hContextMenu, MF_STRING, CMC_QUIT, @"Quit") 
-
-        ' Load cat skin
+      
         var hDC = GetDC(hWnd)
-        loadSkin(hDC, sCurSkin)
+      
+        ' Create dither palette if on paletted display mode
+        if GetDeviceCaps(hDC, BITSPIXEL_) <= 8 then
+            hPalDither = CreateHalftonePalette(hDC)
+            SelectPalette(hDC, hPalDither, TRUE)
+            RealizePalette(hDC)
+        end if
+      
+        DbgPrint("Load default skin")
+        loadSkin(hDC, sCurSkin)      
         ReleaseDC(hWnd, hDC)
+      
+        if IsWin32s = FALSE then 
+            setDoubleBuffer(hWnd)
+            DbgPrint("Double buffer set..")
+        end if
+      
+        dwAnnoyTicks = GetTickCount()
+        DbgPrint("WM_CREATE done")
         return 0
-        
+
     Case WM_PAINT
         Dim as PAINTSTRUCT ps
         var hDC = BeginPaint(hWnd, @ps)
-        hDC = iif(wParam, cast(HDC,wparam), ps.hDC) ' Required for double buffer hook
+        hDC = iif(wParam, cast(HDC, wParam), ps.hDC) ' Required for double buffer hook
         
-        ' Draw cat to window
         dim as HDC hdcMem = CreateCompatibleDC(hDC)
-        var hOld = SelectObject(hdcMem, hbmCatBitmaps(iCatPic))
-        with bmCatBitmap
-            BitBlt(hDC, 0, 0, .bmWidth, .bmHeight, hdcMem, 0, 0, SRCCOPY)
-        end with
-        SelectObject(hdcMem, hOld)
-        DeleteDC(hdcMem)
+        if IsWin32s then  ' Win32s draws to a transparent window on the desktop
+            var hdcMem2 = CreateCompatibleDC(hDC)
+            var hOld2 = SelectObject(hdcMem2, hbmCatMasks(iCatPic))
+            var hOld = SelectObject(hdcMem, hbmCatBmps(iCatPic))
+            
+            with bmCatBitmap
+                for iY as integer = 0 to .bmHeight-1 step 16
+                    BitBlt(hDC, 0, iY, .bmWidth, 16, hdcMem2, 0, iY, SRCAND)              
+                    BitBlt(hDC, 0, iY, .bmWidth, 16, hdcMem, 0, iY, SRCPAINT)
+                next iY
+            end with
+            SelectObject(hdcMem, hOld):DeleteDC(hdcMem)
+            SelectObject(hdcMem2, hOld2):DeleteDC(hdcMem2)
+            
+        else
+            var hOld = SelectObject(hdcMem, hbmCatBmps(iCatPic))
+            with bmCatBitmap
+                BitBlt(hDC, 0, 0, .bmWidth, .bmHeight, hdcMem, 0, 0, SRCCOPY)
+            end with
+            SelectObject(hdcMem, hOld):DeleteDC(hdcMem)
+        end if
         
         EndPaint(hWnd, @ps)
         return 0
-             
+        
+    Case WM_TIMER
+        ' Don't check key presses if window not visible
+        if IsWindowVisible(hWnd) = FALSE then return 0
+        
+        ' Check the annoying timer
+        if iAnnoyingMode AndAlso AnnoyProc <> 0 then
+            var dwNewTicks = GetTickCount()
+            if abs(dwNewTicks-dwAnnoyTicks) > iAnnoyWait then
+                dwAnnoyTicks = dwNewTicks   
+                AnnoyProc()
+            end if      
+        end if
+        
+        'Process global key presses
+        var iResult = CheckKeyStates()
+  
+        ' Set state of cat if it's changed
+        Static as integer iLastState = -1 ' Initalize to -1 to redraw on load
+        if iLastState <> iResult then
+            if iWaitKeyPress then
+                dwAnnoyTicks = GetTickCount() ' reset annoying timer on key hit?
+            end if
+            
+            Dim as HRGN hCopy = 0
+            select case iResult
+            case KD_BOTH : iCatPic = CBM_BOTH   : hCopy = hRgnBoth
+            case KD_LEFT : iCatPic = CBM_LEFT   : hCopy = hRgnLeft
+            case KD_RIGHT: iCatPic = CBM_RIGHT  : hCopy = hRgnRight
+            case else    : iCatPic = CBM_WAITING: hCopy = hRgnMain
+            end select
+          
+            ' Win32s redraws the trans window on the desktop, Win32 uses regions
+            if IsWin32s then
+                if iLastState = KD_NONE OrElse iResult = KD_BOTH then
+                    InvalidateRect(hWnd, NULL, TRUE)
+                else
+                    ReShowWindow(hwnd)              
+                end if
+            else
+                ' Set window region
+                var hRgn = CreateRectRgn(0, 0, 0, 0)
+                CombineRgn(hRgn, hCopy, NULL, RGN_COPY)
+                SetWndRegion(hWnd, hRgn, TRUE)            
+                InvalidateRect(hWnd, NULL, TRUE)
+            end if          
+            iLastState = iResult        
+        end if
+
+    Case WM_WINDOWPOSCHANGED ' Stay ontop of taskbar Win95-XP
+        if IsWindowVisible(hWnd) then
+            SetWindowPos(hWnd, HWND_TOPMOST, NULL, NULL, NULL, NULL, _
+                         SWP_SHOWWINDOW OR SWP_NOSIZE OR SWP_NOMOVE OR SWP_NOACTIVATE)
+        end if
+
     Case WM_CONTEXTMENU
-        dim as integer iX = LOWORD(lParam)
-        dim as integer iY = HIWORD(lParam)
-        TrackPopupMenuEx(hContextMenu, NULL, iX, iY, hWnd, NULL)
-    
+        dim as integer iX = cshort(LOWORD(lParam))
+        dim as integer iY = cshort(HIWORD(lParam))
+        TrackPopupMenu(hContextMenu, TPM_LEFTBUTTON, iX, iY, 0, hWnd, NULL)    
+        
     Case WM_NCHITTEST
         if (GetAsyncKeyState(VK_LBUTTON) AND &H8000) then
             return HTCAPTION ' Enable dragging whenever client left clicked
@@ -138,31 +319,53 @@ Function WndProc (hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as LPARA
         var hDC = GetDC(hWnd)
         loadSkin(hDC, szName)
         ReleaseDC(hWnd, hDC)
-
+        sCurSkin = szName
+        
+        if IsWin32s = FALSE then ' Win32s doesn't use regions
+          Dim as HRGN hRgn = CreateRectRgn(0, 0, 0, 0)
+          CombineRgn(hRgn, hRgnMain, NULL, RGN_COPY)
+          SetWndRegion(hWnd, hRgn, TRUE)
+        end if
+        
         DragFinish(hDrop) ' Free handle
         
     Case WM_COMMAND
         Select Case HIWORD(wParam) ' wNotifyCode
         Case 0 ' Context menu clicked
             Select Case LOWORD(wParam) ' wID of menu item
-            Case CMC_SKINS ' Show skin picker
-                dim as RECT r, rcDesk
+            Case CMC_SKINS
+                dim as RECT r, r2, rcDesk
                 GetWindowRect(hWnd, @r) ' Position window over cat window
-                GetClientRect(GetDesktopWindow(), @rcDesk)
+                SystemParametersInfo(SPI_GETWORKAREA, 0, @rcDesk, NULL)
+                
+                ' Keep skins window within bounds of desktop
                 if r.left+WINDOW_WIDTH > rcDesk.right then
-                    r.left = rcDesk.right-WINDOW_WIDTH
+                    r.left = rcDesk.right-WINDOW_WIDTH-GetSystemMetrics(SM_CXEDGE)*2
                 elseif r.left < rcDesk.left then
                     r.left = rcDesk.left
                 end if
                 
                 if r.top+WINDOW_HEIGHT > rcDesk.bottom then
-                    r.top = rcDesk.bottom-WINDOW_HEIGHT
+                    r.top = rcDesk.bottom-WINDOW_HEIGHT-(GetSystemMetrics(SM_CYSIZEFRAME) _
+                            + GetSystemMetrics(SM_CYEDGE)*2 + GetSystemMetrics(SM_CYCAPTION))
+                elseif r.top < rcDesk.top then ' Windows 3.1 lets you drag above top of screen
+                    r.top = rcDesk.top
                 end if
 
                 ShowWindow(hWnd, SW_HIDE)
                 ShowWindow(hWndSkinSelect, SW_SHOW)
                 SetWindowPos(hWndSkinSelect, 0, r.left, r.top, 0, 0, SWP_NOSIZE OR SWP_NOZORDER)
-                
+                                
+            Case CMC_ANNOYING                
+                if iAnnoyingMode then
+                    CheckMenuItem(hContextMenu, CMC_ANNOYING, MF_UNCHECKED)
+                    iAnnoyingMode = FALSE
+                else
+                    dwAnnoyTicks = GetTickCount() ' Reset counter when mode enabled
+                    CheckMenuItem(hContextMenu, CMC_ANNOYING, MF_CHECKED)
+                    iAnnoyingMode = TRUE
+                end if
+
             Case CMC_CUSTOMLR
                 if iCustomLeftRight then
                     CheckMenuItem(hContextMenu, CMC_CUSTOMLR, MF_UNCHECKED)
@@ -171,6 +374,17 @@ Function WndProc (hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as LPARA
                     CheckMenuItem(hContextMenu, CMC_CUSTOMLR, MF_CHECKED)
                     iCustomLeftRight = TRUE
                 end if
+
+            Case CMC_ABOUT
+                MessageBox(hWnd, _
+                           !"TypoCat Version 1.2\r\n\r\n" + _
+                           !"For more information check out the README file\r\n" + _
+                           !"in the TypoCat directory.\r\n\r\n" + _
+                           !"More great software available at:\r\n" + _ 
+                           !"http://grahamdowney.com/\r\n\r\n" + _
+                           !"Written by Graham Downey (C) 2020", _
+                           "TypoCat", _
+                           MB_OK OR MB_ICONINFORMATION)
                 
             Case CMC_QUIT
                 DestroyWindow(hWnd) ' Quit when quit clicked
@@ -179,6 +393,10 @@ Function WndProc (hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as LPARA
         End Select
         
     Case WM_DESTROY
+        ' Clean up
+        if hPalDither then DeleteObject( hPalDither )
+        if hContextMenu then DestroyMenu(hContextMenu)
+      
         PostQuitMessage(0)
         return 0
         
@@ -187,11 +405,6 @@ Function WndProc (hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as LPARA
     return DefWindowProc(hWnd, iMsg, wParam, lParam)
 End Function
 
-const KD_LEFT  = 1, _
-      KD_RIGHT = 2, _
-      KD_BOTH  = 3, _
-      KD_NONE  = 0
-      
 ' https://docs.microsoft.com/en-us/windows/win32/inputdev/virtual-key-codes
 Function CheckKeyStates() as integer
     dim as integer iKeyStates = 0
@@ -212,7 +425,7 @@ Function CheckKeyStates() as integer
         End Select
         
         if (GetAsyncKeyState(iK) AND &H8000) then
-            ' Generic shift/ctrl/menu will put down both arms
+            ' For generic shift/ctl/alt we can't determine left or right
             if iK = VK_SHIFT orElse iK = VK_CONTROL orElse iK = VK_MENU then
                 iKeyStates OR= KD_RIGHT OR KD_LEFT
             end if
@@ -227,73 +440,52 @@ Function CheckKeyStates() as integer
     return iKeyStates
 End Function
 
-' Called by Windows every ~10ms
-Sub TimerProc(hWnd as HWND, uMsg as uinteger, idEvent as uinteger, dwTime as long)
-    Static as integer iLastState ' Last state of cat
-
-    'Process global key presses
-    var iResult = CheckKeyStates()
-
-    ' Set state of cat if it's changed
-    if iLastState <> iResult then
-        iLastState = iResult
-
-        Dim as HRGN hRgn = CreateRectRgn(0, 0, 0, 0)
-        if iResult = KD_BOTH then
-            iCatPic = CBM_BOTH
-            CombineRgn(hRgn, hRgnBoth, NULL, RGN_COPY)
-                
-        elseif iResult = KD_LEFT then
-            iCatPic = CBM_LEFT
-            CombineRgn(hRgn, hRgnLeft, NULL, RGN_COPY)
+Sub WinMain(hInstance as HINSTANCE, hPrevInstance as HINSTANCE, szCmdLine as PSTR, iCmdShow as Integer)
             
-        elseif iResult = KD_RIGHT then
-            iCatPic = CBM_RIGHT
-            CombineRgn(hRgn, hRgnRight, NULL, RGN_COPY)
-        
-        else ' KD_NONE
-            iCatPic = CBM_WAITING
-            CombineRgn(hRgn, hRgnMain, NULL, RGN_COPY)
-        end if
-        
-        SetWindowRgn(hWnd, hRgn, TRUE)
-        InvalidateRect(hWnd, NULL, TRUE)
-    end if
-End Sub
-
-Sub WinMain(hInstance as HINSTANCE, hPrevInstance as HINSTANCE, _
-            szCmdLine as PSTR, iCmdShow as Integer)
-      
     Dim as HWND       hWnd
     Dim as MSG        msg
     Dim as WNDCLASSEX wcls
-
-    ' Initalize skin picker menu
-    hWndSkinSelect = initPickerWindow(hInstance)
-    LoadSettings() ' Load the app settings from config.ini
-
-    ' Set up main cat window class
+    
+    #ifdef DebugObjects
+    print "Objects before window: ";GetGuiResources( GetCurrentProcess() , GR_GDIOBJECTS ),GetGuiResources( GetCurrentProcess() , GR_USEROBJECTS )
+    #endif
+    
+    LoadSettings()
+    
+    ' If we're on Win2k+ load the annoying lib
+    dim as any ptr hAnnoyLib
+    if IsWin2k then
+        hAnnoyLib = DyLibLoad("Annoying.dll")
+        AnnoyProc = DyLibSymbol(hAnnoyLib, "AnnoyProc")
+        
+        ' Normally used to set the randomizer first run
+        Dim as Sub() InitAnnoying = DyLibSymbol(hAnnoyLib, "InitAnnoying")
+        if InitAnnoying <> 0 then InitAnnoying()
+    end if
+    
     wcls.cbSize        = sizeof(WNDCLASSEX)
-    wcls.style         = CS_HREDRAW OR CS_VREDRAW
+    wcls.style         = iif(IsWin32s, 0, CS_HREDRAW OR CS_VREDRAW) OR CS_OWNDC
     wcls.lpfnWndProc   = cast(WNDPROC, @WndProc)
     wcls.cbClsExtra    = 0
     wcls.cbWndExtra    = 0
     wcls.hInstance     = hInstance
     wcls.hIcon         = LoadIcon(hInstance, "FB_PROGRAM_ICON") 
     wcls.hCursor       = LoadCursor(NULL, IDC_ARROW)
-    wcls.hbrBackground = cast(HBRUSH, COLOR_BTNFACE + 1)
+    wcls.hbrBackground = 0 'cast(HBRUSH, COLOR_BTNFACE + 1)
     wcls.lpszMenuName  = NULL
     wcls.lpszClassName = strptr(szAppName)
     wcls.hIconSm       = LoadIcon(hInstance, "FB_PROGRAM_ICON")
     
     if (RegisterClassEx(@wcls) = FALSE) then
-        Print "Error! Failed to register window class ", Hex(GetLastError())
+        DbgPrint("Error! Failed to register window class " & Hex(GetLastError()))
         sleep: system
     end if
     
     const WINDOW_STYLE = WS_POPUP OR WS_SYSMENU
-    const WINDOW_STYLE_EX = WS_EX_TOPMOST OR WS_EX_TOOLWINDOW OR WS_EX_ACCEPTFILES
- 
+    var WINDOW_STYLE_EX = WS_EX_TOPMOST OR WS_EX_ACCEPTFILES OR _
+                          iif(IsWin32s, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW)
+    
+    DbgPrint("CreateWindowEx..")
     hWnd = CreateWindowEx(WINDOW_STYLE_EX, _      ' Window extended style
                           szAppName, _            ' window class name
                           szCaption, _            ' Window caption
@@ -308,206 +500,170 @@ Sub WinMain(hInstance as HINSTANCE, hPrevInstance as HINSTANCE, _
                           NULL)                   ' Creation parameters
                         
     if hWnd = NULL then system
-            
+
     ShowWindow(hWnd, iCmdShow)
     UpdateWindow(hWnd)
+
+    hWndSkinSelect = initPickerWindow(hInstance)
+
+    SetTimer(hWnd, 1, 10, 0) ' Create timer to check keyboard
     
-    ' Set key checker timer
-    SetTimer(hWnd, 1, 10, cast(TIMERPROC, @TimerProc))
+    #ifdef DebugObjects
+    print "Objects window created: ";GetGuiResources( GetCurrentProcess() , GR_GDIOBJECTS ),GetGuiResources( GetCurrentProcess() , GR_USEROBJECTS )
+    #endif
     
     while (GetMessage(@msg, NULL, 0, 0))
         TranslateMessage(@msg)
         DispatchMessage(@msg)
+        
+        ' So if our window closes while in ProcessMessage we don't hang idle
+        if IsWindow(hWnd) = FALSE then exit while
     wend
-
-    ' Delete bitmaps before quitting
-    for i as integer = 0 to TOTAL_CATS
-        DeleteObject(hbmCatBitmaps(i))
-    next i
+        
+    ' Clean up resources for Win32s after program exits
+    if wcls.hIcon then DestroyIcon(wcls.hIcon)
+    if wCls.hIconSm then DestroyIcon(wcls.hIconSm)
+    if wCls.hCursor then DestroyCursor(wCls.hCursor)
+    if hAnnoyLib then DyLibFree(hAnnoyLib)
     
+    DestroyWindow(hWnd)
+    UnregisterClass(szAppName, hInstance)
+    
+    ReleaseResources()    
+    
+    #ifdef DebugObjects
+      print "Objects after window: ";GetGuiResources( GetCurrentProcess() , GR_GDIOBJECTS ),GetGuiResources( GetCurrentProcess() , GR_USEROBJECTS )
+      sleep
+    #endif
+
     ' Save settings to config.ini
     dim as string sCfgPath = exePath+"\config.ini"
-    dim as string sSkin = "default"
+    
+    ' [default]
     if iSelectedSkin > 0 then
-        sSkin = skins(iSelectedSkin).sDir
+        dim as string sSkin = skins(iSelectedSkin).sDir
+        WritePrivateProfileString("default", "skin", sSkin, sCfgPath)
     end if
-    WritePrivateProfileString("default", "skin", sSkin, sCfgPath)
      
-    dim as string sCustomLR = iif(iCustomLeftRight, "true", "false") 
-    WritePrivateProfileString("default", "customLR", sCustomLR, sCfgPath)
+    dim as string sTF = iif(iCustomLeftRight, "true", "false") 
+    WritePrivateProfileString("default", "customLR", sTF, sCfgPath)
+    
+    ' [annoyMode]
+    sTF = iif(iAnnoyingMode, "true", "false") 
+    WritePrivateProfileString("annoyMode", "enabled", sTF, sCfgPath)
+    WritePrivateProfileString("annoyMode", "waitTime", str(iAnnoyWait), sCfgPath)
+    
+    sTF = iif(iWaitKeyPress, "true", "false") 
+    WritePrivateProfileString("annoyMode", "waitKeyPress", sTF, sCfgPath)
     
     system msg.wParam
 End Sub
 
-' Create window region based on passed bitmap
-Function createWindowRegion(hdcSource as HDC, bmSource as BITMAP, _
-                            clrTrans as COLORREF = BGR(255, 0, 255)) as HRGN
-    var hBmp = GetCurrentObject(hdcSource, OBJ_BITMAP)
-    
-    ' Allocate memory for raw bitmap data
-    var pBmp = cast(COLORREF ptr, malloc(bmSource.bmWidth*bmSource.bmHeight*sizeOf(COLORREF)))
-    
-    dim as BITMAPINFO tBmpInfo
-    with tBmpInfo.bmiHeader
-        .biSize = sizeof(BITMAPINFOHEADER)
-        .biWidth = bmSource.bmWidth
-        .biHeight = -bmSource.bmHeight  ' Hurray for upside down bitmaps!
-        .biBitCount = 32: .biPlanes = 1 ' Create 32bit bitmaps for easy parsing
-    end with
-    
-    ' Copy raw bitmap data into 32bpp buffer
-    GetDIBits(hdcSource, .hBmp, 0, bmSource.bmHeight, pBmp, @tBmpInfo, DIB_RGB_COLORS)
-    
-    ' Temp structure to store RECTs (initially allocate room fro 1022 rects)
-    const InitRcs = 1024-(sizeof(RGNDATAHEADER)\sizeof(RECT)) ' allocate multiples of 4kb
-    var iCurBytes = sizeof(RGNDATAHEADER), iMaxBytes = iCurBytes+InitRcs*sizeof(RECT)
-    var pAlloc = malloc(iMaxBytes), iRc = 0, pRc = cast(RECT ptr, pAlloc+iCurBytes)
-    
-    ' Locate opaque rects
-    dim as integer iX = 0
-    dim as integer ipxPos = 0 ' offset of current pixel in bitmap data
-    for iY as integer = 0 to bmSource.bmHeight-1
-        do
-            ' Skip transparent pixels
-            while (iX < bmSource.bmWidth AndAlso pBmp[ipxPos] = clrTrans)
-                iX += 1: ipxPos += 1
-            wend
-            
-            ' Count how many pixels wide opaque area is
-            dim as integer iLeft = iX
-            while (iX < bmSource.bmWidth AndAlso pBmp[ipxPos] <> clrTrans)
-                iX += 1: ipxPos += 1
-            wend
-            
-            ' Resize RECT buffer if max reached
-            if iCurBytes >= iMaxBytes then
-                iMaxBytes += 512*sizeof(RECT)
-                pAlloc = realloc(pAlloc, iMaxBytes)
-                pRc = cast(RECT ptr, pAlloc+iCurBytes)
-            end if
-            
-            ' Add to RECT buffer
-            *pRc = type<RECT>(iLeft, iY, iX, iY+1)
-            pRc += 1
-            iCurBytes += sizeof(RECT)
-            
-        loop until (iX >= bmSource.bmWidth)
-        iX = 0
-    next iY
-    
-    ' Free bitmap buffer
-    free(pBmp)
-    
-    ' Initalize region data and create region
-    with *cptr(RGNDATAHEADER ptr, pAlloc)
-        .dwSize = sizeof(RGNDATAHEADER)
-        .iType = RDH_RECTANGLES
-        .nCount = (iCurBytes-.dwSize) \ sizeof(RECT)
-        .nRgnSize = 0
-        .rcBound = type(0, 0, bmSource.bmWidth, bmSource.bmHeight)
-    end with
-    dim as HRGN hRgn = ExtCreateRegion(NULL, iCurBytes, pAlloc)
-    
-    ' Now free struct/RECT buffer
-    free(pAlloc)
-    
-    return hRgn
-End Function
+sub SetWndRegion(hWnd as HWND, hRgn as HRGN, iRedraw as integer)
+    if IsWin32s then
+        hRgnCur = hRgn
+        if iRedraw then ReShowWindow( hwnd )
+    else
+        SetWindowRgn( hWnd , hRgn , iRedraw )
+    end if
+end sub
+
+sub ReShowWindow(hWnd as HWND, iNoTrans as long = 1)
+    'disabling transparency, hide/show window, reenable transparency
+    var dwStyle = GetWindowLong(hWnd, GWL_EXSTYLE)
+    if iNoTrans then SetWindowLong(hWnd, GWL_EXSTYLE, dwStyle AND (NOT WS_EX_TRANSPARENT))
+    ShowWindow(hwnd, SW_HIDE)
+    ShowWindow(hwnd, SW_SHOWNA)
+    InvalidateRect(hWnd, NULL, TRUE)
+    if iNoTrans then SetWindowLong(hWnd, GWL_EXSTYLE, dwStyle)
+end sub
 
 ' Calculate the regions for the loaded bitmaps
 Sub createRegions(hDC as HDC)
-    dim as HDC hdcMem = CreateCompatibleDC(hDC)
+    if IsWin32s then exit sub ' Win32s doesn't support window regions
     
-    var hOld = SelectObject(hdcMem, hbmCatBitmaps(CBM_WAITING))
     if hRgnMain then DeleteObject(hRgnMain)
-    hRgnMain = createWindowRegion(hdcMem, bmCatBitmap)
+    hRgnMain = createWindowRegion(hDC, hbmCatMasks(CBM_WAITING), bmCatBitmap)
     
-    SelectObject(hdcMem, hbmCatBitmaps(CBM_LEFT))
     if hRgnLeft then DeleteObject(hRgnLeft)
-    hRgnLeft = createWindowRegion(hdcMem, bmCatBitmap)
-    
-    SelectObject(hdcMem, hbmCatBitmaps(CBM_RIGHT))
+    hRgnLeft = createWindowRegion(hDC, hbmCatMasks(CBM_LEFT), bmCatBitmap)
+        
     if hRgnRight then DeleteObject(hRgnRight)
-    hRgnRight = createWindowRegion(hdcMem, bmCatBitmap)
+    hRgnRight = createWindowRegion(hDC, hbmCatMasks(CBM_RIGHT), bmCatBitmap)
     
-    SelectObject(hdcMem, hbmCatBitmaps(CBM_BOTH))
     if hRgnBoth then DeleteObject(hRgnBoth)
-    hRgnBoth = createWindowRegion(hdcMem, bmCatBitmap)
-    
-    SelectObject(hdcMem, hOld)
-    DeleteDC(hdcMem)
+    hRgnBoth = createWindowRegion(hDC, hbmCatMasks(CBM_BOTH), bmCatBitmap)
 End Sub
 
-' Split 2 frame bitmap in half to create 4 frames of animation
-Sub split2FrameBitmap(hDC as HDC, hCatBitmaps() as HBITMAP)
-    ' Store bitmap info from first bitmap
-    GetObject(hCatBitmaps(CBM_BOTH), sizeOf(bmCatBitmap), @bmCatBitmap)
+Sub split2FrameBitmap(hDC as HDC, hbmBitmaps() as HBITMAP)
+    ' Get bitmap info from first bitmap
+    GetObject(hbmBitmaps(CBM_BOTH), sizeOf(bmCatBitmap), @bmCatBitmap)
     
     ' Create left/right frames by splitting combined frame
     dim as HDC hdcMem = CreateCompatibleDC(hDC)
     dim as HDC hdcMem2 = CreateCompatibleDC(hDC)
-    var hOld2 = SelectObject(hdcMem2, hbmCatBitmaps(CBM_BOTH))
+    var hOld2 = SelectObject(hdcMem2, hbmBitmaps(CBM_BOTH))
     
-    ' Do the split
     with bmCatBitmap
-        var hOld = SelectObject(hdcMem, hbmCatBitmaps(CBM_LEFT))
-        BitBlt(hdcMem, 0, 0, .bmWidth\2, .bmHeight, _
-               hdcMem2, 0, 0, SRCCOPY)
-               
-        SelectObject(hdcMem, hbmCatBitmaps(CBM_RIGHT))               
-        BitBlt(hdcMem, .bmWidth\2, 0, .bmWidth\2, .bmHeight, _
-               hdcMem2, .bmWidth\2, 0, SRCCOPY)
-               
-        SelectObject(hdcMem, hOld)
+        ' Create left frame
+        var hOld = SelectObject(hdcMem, hbmBitmaps(CBM_LEFT))        
+        BitBlt(hdcMem, 0, 0, .bmWidth\2, .bmHeight, hdcMem2, 0, 0, SRCCOPY)
+        ' Create right frame
+        SelectObject(hdcMem, hbmBitmaps(CBM_RIGHT))               
+        BitBlt(hdcMem, .bmWidth\2, 0, .bmWidth\2, .bmHeight, hdcMem2, .bmWidth\2, 0, SRCCOPY)
     end with
     
-    SelectObject(hdcMem2, hOld2)
-    DeleteDC(hdcMem2)
-    DeleteDC(hdcMem)
+    ' Clean up
+    SelectObject(hdcMem , hOld ) : DeleteDC(hdcMem )
+    SelectObject(hdcMem2, hOld2) : DeleteDC(hdcMem2)
 End Sub
 
+' Load the default skin embedded in executable
 Sub loadDefaultSkin(hDC as HDC)
     iSelectedSkin = 0
     
     ' Load bitmap resources
-    hbmCatBitmaps(CBM_WAITING) = LoadBitmap(GetModuleHandle(NULL), @"BM_CAT1")
-    hbmCatBitmaps(CBM_LEFT)    = LoadBitmap(GetModuleHandle(NULL), @"BM_CAT1")
-    hbmCatBitmaps(CBM_RIGHT)   = LoadBitmap(GetModuleHandle(NULL), @"BM_CAT1")
-    hbmCatBitmaps(CBM_BOTH)    = LoadBitmap(GetModuleHandle(NULL), @"BM_CAT2")
-
-    split2FrameBitmap(hDC, hbmCatBitmaps())
+    LoadImageAndMask(hInstance, "BM_CAT1", hbmCatBmps(CBM_WAITING) , hbmCatMasks(CBM_WAITING))
+    LoadImageAndMask(hInstance, "BM_CAT1", hbmCatBmps(CBM_LEFT)    , hbmCatMasks(CBM_LEFT)   )
+    LoadImageAndMask(hInstance, "BM_CAT1", hbmCatBmps(CBM_RIGHT)   , hbmCatMasks(CBM_RIGHT)  )
+    LoadImageAndMask(hInstance, "BM_CAT2", hbmCatBmps(CBM_BOTH)    , hbmCatMasks(CBM_BOTH)   )    
+    
+    split2FrameBitmap(hDC, hbmCatBmps())
+    split2FrameBitmap(hDC, hbmCatMasks())
 End Sub
 
 ' Read the typoskin.ini and load resources from file
 Sub loadSkinResources(hDC as HDC, sSkinPath as string)
-    dim as string sName
-    dim as string sSkinCfg = sSkinPath+SKIN_CFG
     
-    ' Get skin's name
+    dim as string sName    
+    dim as string sSkinCfg = sSkinPath+SKIN_CFG    
     dim as zstring*256 szTmp
+    dim as integer iResu = any
     var iLen = GetPrivateProfileString("skin", "name", "", szTmp, 255, sSkinCfg)
-    printf(!"Loading %s...\r\n", szTmp)
+    DbgPrint( !"Loading " & szTmp & "..." )    
     sName = szTmp
     
     ' Load cat with hands down frame
     iLen = GetPrivateProfileString("skin", "frame2", "cat2.bmp", szTmp, 255, sSkinCfg)
-    hbmCatBitmaps(CBM_BOTH) = LoadImage(NULL, sSkinPath+"\"+szTmp, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE)
+    iResu = LoadImageAndMask(NULL, sSkinPath+"\"+szTmp, hbmCatBmps(CBM_BOTH), hbmCatMasks(CBM_BOTH))
     
-    if hbmCatBitmaps(CBM_BOTH) = NULL then
+    if iResu = NULL then
         dim as string sErr = "Error loading skin '"+sName+!"'!\r\n'"+szTmp+"' not found!"
         ShowWindow(hWndMain, SW_HIDE)
         Messagebox(hWndMain, sErr, "Error!", MB_ICONERROR)
         ShowWindow(hWndMain, SW_SHOW)
-        LoadDefaultSkin(hDC)
+        LoadDefaultSkin(hDC) ' If we error out loading skin revert to default
         return
     end if
     
     ' Load cat with hands up frame
-    iLen = GetPrivateProfileString("skin", "frame1", "cat1.bmp", szTmp, 255, sSkinCfg)
-    hbmCatBitmaps(CBM_WAITING) = LoadImage(NULL, sSkinPath+"\"+szTmp, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE)
+    iLen = GetPrivateProfileString("skin", "frame1", "cat1.bmp", szTmp, 255, sSkinCfg)    
+    iResu = LoadImageAndMask(NULL, sSkinPath+"\"+szTmp, hbmCatBmps(CBM_WAITING), hbmCatMasks(CBM_WAITING))
     
-    if hbmCatBitmaps(CBM_WAITING) = NULL then
-        DeleteObject(hbmCatBitmaps(CBM_BOTH)) ' Prevent handle leaks
+    if iResu = NULL then
+        DeleteObject(hbmCatBmps(CBM_BOTH)) ' Prevent handle leaks
+        DeleteObject(hbmCatMasks(CBM_BOTH))
+        
         dim as string sErr = "Error loading skin '"+sName+!"'!\r\n'"+szTmp+"' not found!"
         ShowWindow(hWndMain, SW_HIDE)
         Messagebox(hWndMain, sErr, "Error!", MB_ICONERROR)
@@ -516,41 +672,67 @@ Sub loadSkinResources(hDC as HDC, sSkinPath as string)
         return
     end if
     
-    hbmCatBitmaps(CBM_LEFT) = LoadImage(NULL, sSkinPath+"\"+szTmp, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE)
-    hbmCatBitmaps(CBM_RIGHT) = LoadImage(NULL, sSkinPath+"\"+szTmp, IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE)
-            
-    split2FrameBitmap(hDC, hbmCatBitmaps())
+    ' Load image for left/right skins
+    LoadImageAndMask(NULL, sSkinPath+"\"+szTmp, hbmCatBmps(CBM_LEFT), hbmCatMasks(CBM_LEFT))
+    LoadImageAndMask(NULL, sSkinPath+"\"+szTmp, hbmCatBmps(CBM_RIGHT), hbmCatMasks(CBM_RIGHT))            
+    split2FrameBitmap(hDC, hbmCatBmps())
+    split2FrameBitmap(hDC, hbmCatMasks())
 End Sub
 
 Sub loadSkin(hDC as HDC, sSkinPath as string)
+    
     ' Close any open DC handles
+    DbgPrint("Delete Previous Region")
     for i as integer = 0 to TOTAL_CATS
-        if hbmCatBitmaps(i) <> NULL then
-            DeleteObject(hbmCatBitmaps(i))
-        end if
+        if hbmCatBmps(i)  then DeleteObject(hbmCatBmps(i) ): hbmCatBmps(i)=0
+        if hbmCatMasks(i) then DeleteObject(hbmCatMasks(i)): hbmCatMasks(i)=0
     next i
 
-    ' if no path specified load default skin
     if sSkinPath = "" then
+        DbgPrint("No name so load default skin")
         LoadDefaultSkin(hDC)
     else
         dim as string sSkinCfg = sSkinPath+SKIN_CFG
         if dir(sSkinCfg) = "" then ' No skin config file???
             ' Silently error our since it's probably a config.ini issue
+            DbgPrint("No skin config file so load default skin")
             LoadDefaultSkin(hDC)
         else
+            DbgPrint("Loading Skin resources")
             loadSkinResources(hDC, sSkinPath)
         end if
     end if
     
     ' Create the window regions based on bitmap
+    dim as double TMR = timer
+    DbgPrint("Creating regions for this resource")
     createRegions(hDC)
+    DbgPrint("Regions Created in " & cint((timer-TMR)*1000) & "ms")
     
     ' Set window's initial region to the idle cat region
-    Dim as HRGN hRgn = CreateRectRgn(0, 0, 0, 0)
-    CombineRgn(hRgn, hRgnMain, NULL, RGN_COPY)
-    SetWindowRgn(hWndMain, hRgn, TRUE)
+    if IsWin32s = FALSE then ' (Regions don't work on Win32s)
+      DbgPrint("Create initial region")
+      Dim as HRGN hRgn = CreateRectRgn(0, 0, 0, 0)
+      CombineRgn(hRgn, hRgnMain, NULL, RGN_COPY)
+      DbgPrint("Set window region")
+      SetWndRegion(hWndMain, hRgn, TRUE)
+    end if
+    
+    ' Resize window to bitmap size
+    SetWindowPos(hWndMain, 0, 0, 0, bmCatBitmap.bmWidth, bmCatBitmap.bmHeight, _
+                 SWP_NOMOVE or SWP_NOZORDER or SWP_NOACTIVATE)
 End Sub
+
+Sub ReleaseResources()  
+  for i as integer = 0 to TOTAL_CATS
+    if hbmCatBmps(i) then DeleteObject(hbmCatBmps(i)): hbmCatBmps(i) = 0
+    if hbmCatMasks(i) then DeleteObject(hbmCatMasks(i)): hbmCatMasks(i) = 0
+  next 
+  if hRgnMain then DeleteObject(hRgnMain): hRgnMain = 0
+  if hRgnLeft then DeleteObject(hRgnLeft): hRgnLeft = 0
+  if hRgnRight then DeleteObject(hRgnRight): hRgnRight = 0
+  if hRgnBoth then DeleteObject(hRgnBoth): : hRgnBoth = 0
+end sub
 
 ' Load the app settings from the config file
 Sub loadSettings()
@@ -560,33 +742,34 @@ Sub loadSettings()
             print "Error creating config file!"
         else
             ' Write default config
-            print #1, !"[default]\r\nskin=default\r\ncustomLR=true"
+            print #1, !"[default]\r\nskin=default\r\ncustomLR=true\r\n"
+            print #1, !"[annoyMode]\r\nenabled=false\r\nwaitTime=300000\r\nwaitKeyPress=false"
             close #1
         end if
     end if
     
     ' Start in CustomLR mode?
-    Dim as zstring*6 szCustomLR
-    var iLen = GetPrivateProfileString("default", "customLR", "true", szCustomLR, 255, sCfgPath)
-    if lcase(szCustomLR) = "true" then
-        iCustomLeftRight = TRUE
-    else
-        iCustomLeftRight = FALSE
-    end if
+    Dim as zstring*6 szTF
+    var iLen = GetPrivateProfileString("default", "customLR", "true", szTF, 5, sCfgPath)
+    iCustomLeftRight = (lcase(szTF) = "true")
     
     ' Load last used skin
     Dim as zstring*256 szSkinPath
     iLen = GetPrivateProfileString("default", "skin", "", szSkinPath, 255, sCfgPath)
-    
-    ' Check if last loaded skin is in skin picker UI
-    for i as integer = 1 to ubound(skins)
-        if szSkinPath = skins(i).sDir then
-            iSelectedSkin = i
-            exit for
-        end if
-    next i
-    
+        
     ' Set path
     sCurSkin = exepath+"\skins\"+szSkinPath
+    
+    ' Start with annoyMode enabled?
+    iLen = GetPrivateProfileString("annoyMode", "enabled", "false", szTF, 5, sCfgPath)
+    iAnnoyingMode = (lcase(szTF) = "true")
+    
+    ' Wait time before annoying stuff
+    iAnnoyWait = GetPrivateProfileInt("annoyMode", "waitTime", 300000, sCfgPath)
+    
+    ' Do key presses interrupt wait time?
+    iLen = GetPrivateProfileString("annoyMode", "waitKeyPress", "false", szTF, 5, sCfgPath)
+    iWaitKeyPress = (lcase(szTF) = "true")
 end sub
+
 

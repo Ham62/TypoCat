@@ -1,4 +1,6 @@
 #include once "win\commctrl.bi"
+#include "ProgressDialog.bas"
+
 type CatSkin
     sDir as string
     sName as string
@@ -13,29 +15,39 @@ dim shared as integer iSkins = 0 ' Number of skins in skins folder
 redim shared as CatSkin skins()  ' Skins from skins folder
 
 ' Convert a passed bitmap to a 64x64 icon
-Function toIcon(hDC as HDC, hbmSource as HBITMAP) as HBITMAP
+Function toIcon(hDC as HDC, hbmSource as HBITMAP, hbmMask as HBITMAP = 0) as HBITMAP
     dim as HDC hdcMem, hdcMem2
     dim as BITMAP bm
    
     ' Create DCs to draw masks to
     hdcMem = CreateCompatibleDC(hDC)
     hdcMem2 = CreateCompatibleDC(hDC)
+    
+    ' Set pallet for palleted displays
+    if GetDeviceCaps(hDC , BITSPIXEL_) <= 8 then
+      SelectPalette(hDC, hPalDither, FALSE): RealizePalette(hDC)
+      SelectPalette(hDCMem, hPalDither, FALSE): RealizePalette(hDCMem)
+      SelectPalette(hDCMem2, hPalDither, FALSE): RealizePalette(hDCMem2)
+    end if
    
     GetObject(hbmSource, sizeOf(bm), @bm)
        
     ' Create transparency mask
-    dim as HBITMAP hbmMask = CreateBitmap(bm.bmWidth, bm.bmHeight, 1, 1, NULL)
+    dim as HBITMAP hbmMask2 = hbmMask
+    if hbmMask = 0 then hbmMask2 = CreateBitmap(bm.bmWidth, bm.bmHeight, 1, 1, NULL)
    
     ' Load source image
     var hTmp1 = SelectObject(hdcMem, hbmSource)
-    var hTmp2 = SelectObject(hdcMem2, hbmMask)
+    var hTmp2 = SelectObject(hdcMem2, hbmMask2)
    
     ' Create masks
-    SetBkColor(hdcMem, BGR(255, 0, 255)) ' Specify magenta as color to base mask off
-    BitBlt(hdcMem2, 0, 0, bm.bmWidth, bm.bmHeight, hdcMem, 0, 0, SRCCOPY)   ' create mask
-    SetBkColor(hdcMem, BGR(0, 0, 0)):SetTextColor(hDCMem, BGR(255,255,255))
-    BitBlt(hdcMem, 0, 0, bm.bmwidth, bm.bmHeight, hdcMem2, 0, 0, SRCAND)    ' set bg to black
-    SetBkColor(hdcMem, BGR(255, 255, 255)):SetTextColor(hDCMem, BGR(0,0,0))
+    if hbmMask = 0 then
+      SetBkColor(hdcMem, BGR(255, 0, 255)) ' Specify magenta as color to base mask off
+      BitBlt(hdcMem2, 0, 0, bm.bmWidth, bm.bmHeight, hdcMem, 0, 0, SRCCOPY)   ' create mask
+      SetBkColor(hdcMem, BGR(0, 0, 0)):SetTextColor(hDCMem, BGR(255,255,255))
+      BitBlt(hdcMem, 0, 0, bm.bmwidth, bm.bmHeight, hdcMem2, 0, 0, SRCAND)    ' set bg to black
+      SetBkColor(hdcMem, BGR(255, 255, 255)):SetTextColor(hDCMem, BGR(0,0,0))
+    end if
    
     ' Create destination icon in memory
     dim as HBITMAP hbmIcon = CreateCompatibleBitmap(hDC, ICON_SIZE, ICON_SIZE)
@@ -44,7 +56,7 @@ Function toIcon(hDC as HDC, hbmSource as HBITMAP) as HBITMAP
     ' Copy image to icon
     with bm
         ' Set icon bg color
-        FillRect(hdcMem, @type<RECT>(0, 0, .bmWidth, .bmHeight), cast(HBRUSH, COLOR_BTNFACE+1))
+        FillRect(hdcMem, @type<RECT>(0, 0, .bmWidth, .bmHeight), GetSysColorBrush(COLOR_BTNFACE))
                
         ' Draw mask
         dim as integer iHeight = (.bmHeight/.bmWidth)*ICON_SIZE
@@ -66,30 +78,53 @@ Function toIcon(hDC as HDC, hbmSource as HBITMAP) as HBITMAP
     DeleteDC(hdcMem2)
  
     ' Delete unneeded bitmaps
-    DeleteObject(hbmMask)
+    DeleteObject(hbmMask2)
     DeleteObject(hbmSource)
  
     return hbmIcon
 End Function
 
 ' Scan skins directory for loadable skins
-Sub findSkins(hDC as HDC)
+Sub findSkins(hDC as HDC)    
     ' The first skin is always the default cat
     redim preserve skins(10)
     with Skins(0)
-        dim as HBITMAP hBm = LoadBitmap(GetModuleHandle(NULL), @"BM_CAT1")
-        .sDir = "."
+        dim as HBITMAP hBm, hBmMask
+        LoadImageAndMask(hInstance, "BM_CAT1", hBm, hBmMask)
+        .sDir = ""
         .sName = "Default"
         .sInfo = "The classic Typo we all know and love!"
-        .hbmIcon = toIcon(hDC, hBm)
+        .hbmIcon = toIcon(hDC, hBm, hBmMask)
         iSkins += 1
     end with
 
-    ' Scan skins directory for other skins
+    ' Count how many skins in in folder
+    Dim as integer iDirs = 0
     Dim as string sDir
     sDir = Dir("skins\*", fbdirectory)
-    print "finding Skins..."
     while len(sDir) > 0
+        if sDir[0] = asc(".") then
+            sDir = Dir()
+            continue while
+        end if
+        iDirs += 1
+        sDir = Dir()
+    wend
+    
+    ' Initalize progress bar
+    var hWndProg = ProgDialog.initProgressDialog(NULL, 0, iDirs*2, 1)
+    dim as HWND hWndProgText = GetDlgItem(hWndProg, ProgDialog.wcInfo)
+    dim as HWND hWndProgBar = GetDlgItem(hWndProg, ProgDialog.wcProgBar)
+    SendMessage(hWndProgBar, PBM_SETPOS, 0, 0)
+    ShowWindow(hWndProg, SW_SHOW)
+
+    ' Scan skins directory for other skins
+    DbgPrint("finding Skins...")
+    sDir = Dir("skins\*", fbdirectory)
+    while len(sDir) > 0
+        static as MSG msg = any
+        ProcessMessages()
+        
         ' Ignore folders starting with '.'
         if sDir[0] = asc(".") then
             sDir = Dir()
@@ -103,8 +138,9 @@ Sub findSkins(hDC as HDC)
 
             dim as zstring*256 szName
             var iLen = GetPrivateProfileString("skin", "name", sDir, szName, 255, sCfg)
-            print "found Skin:"
-            printf(!"  %s :: %s\r\n", sDir, szName)
+            SetWindowText(hWndProgText, "Loading "+szName+"...")
+            DbgPrint("found Skin:")
+            DbgPrint("  " & sDir & " :: " & szName)
             
             dim as zstring*256 szFileName
             iLen = GetPrivateProfileString("skin", "icon", "", szFileName, 255, sCfg)
@@ -112,8 +148,10 @@ Sub findSkins(hDC as HDC)
                 iLen = GetPrivateProfileString("skin", "frame1", "", szFileName, 255, sCfg)
             end if
 
-            dim as HBITMAP hBm = LoadImage(NULL, "skins\"+sDir+"\"+szFileName, _
-                                           IMAGE_BITMAP, 0, 0, LR_LOADFROMFILE)
+            dim as HBITMAP hBm, hBmMask
+            LoadImageAndMask(NULL, "skins\"+sDir+"\"+szFileName, hBm, hBmMask)
+            ProcessMessages() ' Loading image can be slow
+            SendMessage(hWndProgBar, PBM_STEPIT, 0, 0)
             
             iLen = GetPrivateProfileString("skin", "info", "", szFileName, 255, sCfg)
             
@@ -123,19 +161,22 @@ Sub findSkins(hDC as HDC)
                 .sDir = sDir
                 .sName = szName
                 .sInfo = szFileName
-                .hbmIcon = toIcon(hDC, hBm)
+                .hbmIcon = toIcon(hDC, hBm, hBmMask)
             end with
             
             iSkins += 1
+            SendMessage(hWndProgBar, PBM_STEPIT, 0, 0)
         end if
         sDir = Dir()
     wend
     
+    DestroyWindow(hWndProg) ' Clean up progress dialog
+    
     ' Resize to exact number of entries we have
     redim preserve skins(iSkins-1)
     
-    print !"\r\n"+String(40, "-")
-    printf(!"  %d skins loaded total\r\n", iSkins)
+    DbgPrint(!"\r\n"+String(40, "-"))
+    DbgPrint("  " & iSkins & " skins loaded total")
 End Sub
 
 enum WindowControls
@@ -196,19 +237,7 @@ Function SkinPickerProc(hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as
         for iCTL as integer = wcMain to wcLast-1
             SendMessage(CTL(iCTL), WM_SETFONT, cast(wParam, fntDefault), TRUE)
         next iCTL
-
-        ' Load skin info/icons
-        findSkins(hDC)
-        for i as integer = 0 to ubound(skins)
-            ' Populate listbox with skins
-            SendMessage(CTL(wcSkinList), LB_ADDSTRING, 0, cast(lParam, skins(i).sName))
-        next i
-        
-        ' Select selected skin
-        if iSelectedSkin >= 0 then
-            SendMessage(CTL(wcSkinList), LB_SETCURSEL, iSelectedSkin, 0)
-        end if
-        
+                
         ReleaseDC(hWnd, hDC)
         return 0
         
@@ -236,7 +265,7 @@ Function SkinPickerProc(hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as
 
             ' Draw background of item to window color
             FillRect(hDC, @type<RECT>(r.left, r.top, r.right, r.bottom), _
-                     cast(HBRUSH, COLOR_BTNFACE+1))
+                     GetSysColorBrush(COLOR_BTNFACE))
 
             ' If item is selected draw highlighted color and set text color
             if pDIS->itemState = ODS_SELECTED then
@@ -283,14 +312,12 @@ Function SkinPickerProc(hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as
             ' Line between icon and text
             var hPen = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_GRAYTEXT))
             SelectObject(hDC, hPen)
-            
             MoveToEx(hDC, iTxtLeft, r.top, NULL)
             LineTo(hDC, iTxtLeft, r.bottom)
 
             ' Line separating each row
             dim as HPEN hPen2 = CreatePen(PS_SOLID, 1, GetSysColor(COLOR_WINDOWFRAME))
             var hOldPen = SelectObject(hDC, hPen2)
-            
             MoveToEx(hDC, r.left, r.bottom-1, NULL)
             LineTo(hDC, r.right, r.bottom-1)
             
@@ -305,9 +332,39 @@ Function SkinPickerProc(hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as
         
         return TRUE
     
-    Case WM_SHOWWINDOW        
+    Case WM_SHOWWINDOW
+        if iSkins = 0 then
+            ' Load skin info/icons first time we open the window
+            var hDC = GetDC(hWnd)
+            findSkins(hDC)
+            ReleaseDC(hWnd, hDC)
+            for i as integer = 0 to ubound(skins)
+                ' Populate listbox with skins
+                SendMessage(CTL(wcSkinList), LB_ADDSTRING, 0, cast(lParam, skins(i).sName))
+            next i
+        end if
+        
         ' Highlight currently selected skin
-        if iSelectedSkin = -1 then iSelectedSkin = 0
+        if iSelectedSkin = -1 then ' -1 means loaded from drag/drop
+            dim as integer iPos = len(sCurSkin) ' Get directory name from path
+            while iPos > 0 AndAlso sCurSkin[iPos] <> asc("\")
+                iPos -= 1
+            wend
+            
+            iSelectedSkin = 0
+            if iPos > 0 then ' Check if last loaded skin is in skin picker UI
+                dim as string sSkinPath = mid(sCurSkin, iPos+2)
+                print sCurSkin, sSkinPath
+                for i as integer = 1 to ubound(skins)
+                    if sSkinPath = skins(i).sDir then
+                        iSelectedSkin = i
+                        exit for
+                    end if
+                next
+            end if
+        end if
+        
+        ' Select current skins
         SendMessage(CTL(wcSkinList), LB_SETCURSEL, iSelectedSkin, 0)
     
     Case WM_COMMAND
@@ -340,7 +397,7 @@ Function SkinPickerProc(hWnd as HWND, iMsg as uLong, wParam as WPARAM, lParam as
         elseif zDelta < 0 AndAlso iTopIndex < (ubound(skins)-2) then
             SendMessage(CTL(wcSkinList), LB_SETTOPINDEX, iTopIndex+1, 0)
         end if
-        
+
     Case WM_CLOSE
         ShowWindow(hWnd, SW_HIDE)
         ShowWindow(hWndMain, SW_SHOW)
@@ -371,7 +428,7 @@ Function initPickerWindow(hInstance as HINSTANCE) as HWND
                                    IMAGE_ICON, 16, 16, LR_DEFAULTSIZE)
     
     if (RegisterClassEx(@wcls) = FALSE) then
-        Print "Error! Failed to register window class ", Hex(GetLastError())
+        DbgPrint("Error! Failed to register window class " & Hex(GetLastError()))
         sleep: system
     end if
     
@@ -392,3 +449,5 @@ Function initPickerWindow(hInstance as HINSTANCE) as HWND
     return hWnd
 
 End Function
+
+
