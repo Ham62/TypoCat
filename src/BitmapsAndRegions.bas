@@ -267,7 +267,7 @@ Function createWindowRegion(hDC as HDC, hBmMask as HBITMAP, bmSource as BITMAP) 
     dim as integer iX = 0
         
     'Get Bitmap bits to look for transparent areas
-    var pBits = allocate(bmSource.bmWidth*bmSource.bmHeight)
+    var pBits = allocate(bmSource.bmWidthBytes*bmSource.bmHeight)
     if pBits = 0 then
       DbgPrint("Failed to allocate bits")
     end if
@@ -279,7 +279,7 @@ Function createWindowRegion(hDC as HDC, hBmMask as HBITMAP, bmSource as BITMAP) 
     dim as BITMAPINFO256 tBmpInfo256
     with tBmpInfo256.bmiHeader
       .biSize = sizeof(BITMAPINFOHEADER)
-      .biWidth = bmSource.bmWidth    : .biPlanes = 1
+      .biWidth = bmSource.bmWidthBytes    : .biPlanes = 1
       .biHeight = bmSource.bmHeight : .biBitCount = 8
       .biCompression = BI_RGB
     end with
@@ -299,25 +299,25 @@ Function createWindowRegion(hDC as HDC, hBmMask as HBITMAP, bmSource as BITMAP) 
     
     const InitRcs = 1536-(HdrSz\sizeof(RECT)) 'make bytes a multiple of 4096 bytes
     var iCurBytes =  HdrSz, iMaxBytes = iCurBytes+InitRcs*sizeof(RECT)
-    var pAlloc = Allocate(iMaxBytes), iRc = 0, pRc = cast(RECT ptr,pAlloc+iCurBytes)    
+    var pAlloc = Allocate(iMaxBytes), iRc = 0, pRc = cast(RECT ptr,pAlloc+iCurBytes)   
     if pAlloc = 0 then
       DbgPrint("Failed to allocate memory for temp array")
     end if
     
-    var pPix = cast(ubyte ptr,pBits+bmSource.bmWidth*(bmSource.bmHeight+1))
+    var pPix = cast(ubyte ptr,pBits+bmSource.bmWidthBytes*(bmSource.bmHeight+1))
     
     'locate opaque rects
     for iY as integer = 0 to bmSource.bmHeight-1
-        iX = 0 : pPix -= bmSource.bmWidth*2
+        iX = 0 : pPix -= bmSource.bmWidthBytes*2
         do
             ' Skip over transparent pixels
-            while (iX < bmSource.bmWidth AndAlso *pPix)                
+            while (iX < bmSource.bmWidthBytes AndAlso *pPix)                
                 iX += 1: pPix += 1
             wend
             
             ' Count how wide this pixel area is
             dim as integer iLeft = iX
-            while (iX < bmSource.bmWidth AndAlso *pPix=0)
+            while (iX < bmSource.bmWidthBytes AndAlso *pPix=0)
                 iX += 1: pPix += 1
             wend
             
@@ -334,10 +334,9 @@ Function createWindowRegion(hDC as HDC, hBmMask as HBITMAP, bmSource as BITMAP) 
             *pRc = type(iX,iY+1,iLeft,iY+1)
             pRc += 1: iCurBytes += sizeof(RECT)
             
-        loop until (iX >= bmSource.bmWidth)
+        loop until (iX >= bmSource.bmWidthBytes)
         
     next iY
-    
     'var hDC = GetDC(0)
     'SetDibitsToDevice( hDC , 0 , 0 , bmSource.bmWidth,bmSource.bmHeight , 0,0 , 0 , bmSource.bmHeight , pBits , @tBmpInfo , DIB_RGB_COLORS )
     'sleep 1000,1
@@ -355,7 +354,7 @@ Function createWindowRegion(hDC as HDC, hBmMask as HBITMAP, bmSource as BITMAP) 
         .iType = RDH_RECTANGLES
         .nCount = (iCurBytes-.dwSize)\sizeof(RECT)      
         .nRgnSize = 0
-        .rcBound = type(0,0,bmSource.bmWidth,bmSource.bmHeight)
+        .rcBound = type(0,0,bmSource.bmWidthBytes,bmSource.bmHeight)
       end with
       var hRgn = ExtCreateRegion( NULL , iCurBytes , pAlloc )    
       if hRgn = 0 then
